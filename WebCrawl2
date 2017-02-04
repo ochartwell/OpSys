@@ -1,0 +1,298 @@
+#include <stdlib.h>
+#include <unistd.h>
+#include <stdio.h>
+#include <string.h>
+#include <assert.h>
+#include <stdint.h>
+#include <pthread.h>
+
+/*
+TODO:
+1) queue of links (parser to downloaders). Fixed size
+2) queue of pages (downloaders to parsers). unbounded
+3) hash set
+
+QUEUE OF LINKS
+parser waits when queue is full (need cond variable)
+downloaders waits when queue is empty (need cond variable)
+need mutex
+
+QUEUE OF PAGES (unbounded)
+parser waits when the queue is empty (need cond variable)
+downloader waits never
+need mutex
+
+HASH SET
+1 mutex
+hash function (when given string, figure out where to insert inside hashtable)
+
+WAITING UNTIL DONE
+1 cond var, 1 mutex
+
+
+volatile int running_threads = 0;
+pthread_mutex_t running_mutex = PTHREAD_MUTEX_INITIALIZER;
+*/
+
+//Concurrent Queue
+typedef struct __node_t {
+  char *url;
+  char *from;
+  struct __node_t *next;
+} node_t;
+typedef struct __queue_t {
+  node_t *head;
+  node_t *tail;
+  pthread_mutex_t headLock;
+  pthread_mutex_t tailLock;
+  pthread_cond_t notFull, fill;
+  int size;
+  int max_size;
+} queue_t;
+
+//global variables
+queue_t *links;
+queue_t *pages;
+queue_t *visited;
+
+char * (*fetch_fn)(char *);
+void (*edge_fn)(char *, char *);
+
+void Queue_Init(queue_t *q, int queue_size) {
+  node_t *tmp = malloc(sizeof(node_t));
+  tmp->next=NULL;
+  q->head = q->tail = tmp;
+  q->size=0;
+  q->max_size = queue_size;
+  pthread_cond_init(&q->notFull, NULL);
+  pthread_cond_init(&q->fill, NULL);
+  pthread_mutex_init(&q->headLock, NULL);
+  pthread_mutex_init(&q->tailLock, NULL);
+}
+
+void Queue_Enqueue(queue_t *q, char *url, char *from) {
+  node_t *tmp = malloc(sizeof(node_t));
+  assert(tmp != NULL);
+  //printf("url to add: %s\n", url);
+  tmp->url = url;
+  tmp->from = from;
+  tmp->next = NULL;
+
+  q->tail->next = tmp;
+  q->tail = tmp;
+  q->size++;
+  //printf("enqueued urL: %s\n", q->head->next->url);
+}
+
+char** Queue_Dequeue(queue_t *q) {
+  //pthread_mutex_lock(&q->headLock);
+  node_t *tmp = q->head;
+  char** strings = (char**)malloc(sizeof(char*)*2);
+  strings[0]=tmp->next->url;
+  strings[1]=tmp->next->from;
+  //printf("dequeuing strings: %s,%s\n",strings[0], strings[1]);
+  node_t *newHead = tmp->next;
+
+  if (newHead == NULL) {
+        return NULL; // queue was empty
+  }
+
+  q->head = newHead;
+  q->size--;
+  //pthread_mutex_unlock(&q->headLock);
+  //free(tmp);
+  //free(newHead);
+  return strings;
+}
+
+void *parser(void *arg) {
+  //char *page, *from;
+  char **string = (char**)malloc(sizeof(char*)*2);
+  int i;
+  int pos, line_size =128;
+  char **tokens=malloc(line_size*sizeof(char*));
+  char *token;
+
+  while(1) {
+    //lock head of PAGES and pop of page to parse
+    pthread_mutex_lock(&pages->headLock);
+
+    while(pages->size == 0) {
+      if(links->size == 0) {
+        exit(0); //correct?
+      }
+      //printf("parser sleeping on pages->fill\n");
+      pthread_cond_wait(&pages->fill, &pages->headLock); //wait until pages has something in it
+           //printf("parser woke up from pages->fill\n");
+    }
+
+    string=Queue_Dequeue(pages);
+    pthread_mutex_unlock(&pages->headLock); //unlock after dequeue
+
+    //page = string[0];
+    //from = string[1];
+    //free(strings);
+    //printf("done dequeuing\n");
+
+    pos=0;
+    token=strtok_r(string[0]," :\n",&string[0]);
+
+    while(token!=NULL) {
+      tokens[pos]=token;
+      //printf("%s\n",tokens[pos]);
+      pos++;
+      token = strtok_r(NULL, " :\n",&string[0]);
+    }
+
+    //printf("done parsing\n");
+
+    i=0;
+    //done parsing, ready to add the links into LINKS so lock the tail
+    while(i<pos-1) {
+      //printf("enter while loop, i: %d, pos: %d\n", i, pos);
+       pthread_mutex_lock(&links->tailLock);
+      while (links->size == links->max_size){
+        //printf("parser sleeping on links->notFull\n");
+        pthread_cond_wait(&links->notFull, &links->tailLock); //if LINKS is full, wait until not full
+        //printf("parser woke up from links->notFull\n");
+      }
+
+      //printf("checking for 'link'\n");
+      if(strcmp(tokens[i],"link")==0) {
+        //printf("%s\n",tokens[i+1]);
+        Queue_Enqueue(links,tokens[i+1], NULL);
+        edge_fn(string[1], tokens[i+1]);
+        //printf("time to wake up downloader\n");
+        pthread_cond_signal(&links->fill); // wake up downloader, work in links
+               }
+      pthread_mutex_unlock(&links->tailLock); //done adding into queue for now, should unlock before calling edge
+      i++;
+    }
+    //printf("exit while loop\n");
+    free(string);
+  }
+
+  // return NULL;
+}
+
+int check_visited(char *url) {
+  //printf("visited size: %d\n",visited->size);
+  if(visited->size == 0) {
+    return 0;
+  }
+  node_t *tmp = visited->head;
+  while (tmp->next!=NULL) {
+    //printf("checking %s-->%s\n",url, tmp->next->url);
+    if(strcmp(tmp->next->url, url)==0) {
+      //printf("page already visited\n");
+        return 1; //already visited
+    }
+    tmp = tmp->next;
+  }
+  //printf("page not found\n");
+  return 0; //not found
+}
+
+void *downloader(void *arg) {
+  char *page;
+  char** string2 = (char**)malloc(sizeof(char*)*2);
+
+  while(1) {
+    //lock the head of links, pop of link to download
+    pthread_mutex_lock(&links->headLock);
+    while (links->size==0) {
+      //printf("downloader sleeping on link->fill\n");
+      if(pages->size == 0) {
+        exit(0); //correct?
+      }
+     pthread_cond_wait(&links->fill, &links->headLock); //if no links, downloader waits until there is one
+      //printf("downloader woke up from link->fill\n");
+    }
+    //printf("not zero\n");
+    string2=Queue_Dequeue(links); //should unlock immediately after dequeuing
+    //printf("time to wake up parser on notFull\n");
+    pthread_cond_signal(&links->notFull); //just popped off a link so links should not be full
+    //printf("sent signal to wake up parse on notFull\n");
+    pthread_mutex_unlock(&links->headLock);
+
+    if(check_visited(string2[0])==0) {
+      page=fetch_fn(string2[0]); //download, never hold a lock while calling fetch or edge!
+      pthread_mutex_lock(&pages->tailLock); //downloaded page needs to be added into PAGES
+      Queue_Enqueue(pages, page, string2[0]); //add to pages
+      // printf("time to wake up parser, size of pages: %d\n", pages->size);
+      pthread_cond_signal(&pages->fill); // wake up parser, work in pages
+      //printf("sent signal to wake up parser\n");
+      pthread_mutex_unlock(&pages->tailLock);
+
+      pthread_mutex_lock(&visited->tailLock);
+      Queue_Enqueue(visited, string2[0], NULL); //update links traversed
+      pthread_mutex_unlock(&visited->tailLock);
+      //printf("done adding to visited\n");
+    }
+  }
+  free(string2);
+  //return NULL;
+}
+
+int crawl(char *start_url,
+          int download_workers,
+          int parse_workers,
+          int queue_size,
+          char * (*_fetch_fn)(char *url),
+          void (*_edge_fn)(char *from, char *to)) {
+  /*basic algorithm
+    1.	Begin with a base URL that you select, and place it on the top of your queue
+    2. Pop the URL at the top of the queue and download it
+    3. Parse the downloaded HTML file and extract all links
+    4. Insert each extracted link into the queue
+    5. Goto step 2, or stop once you reach some specified limit
+  */
+  //printf("start url: %s\n", start_url);
+  links = (queue_t *) malloc(sizeof(queue_t));
+  pages = (queue_t *) malloc(sizeof(queue_t));
+  visited = (queue_t *) malloc(sizeof(queue_t));
+  pthread_t p[parse_workers], d[download_workers];
+
+  //printf("before initalize");
+  Queue_Init(links, queue_size);
+  //printf("initialized links");
+  Queue_Init(pages, 1);
+  Queue_Init(visited, 0);
+  Queue_Enqueue(links, start_url, NULL);
+  //printf("size of links after pushing start_url: %d, link: %s\n", links->size, links->head->next->url);
+
+  fetch_fn = _fetch_fn;
+  edge_fn = _edge_fn;
+
+  //printf("before create");
+  int i;
+  for (i=0;i<parse_workers;i++) {
+    pthread_create(&p[i], NULL, parser,NULL);
+  }
+  for(i=0;i<download_workers;i++) {
+    pthread_create(&d[i], NULL, downloader,NULL);
+  }
+
+  for(i=0;i<parse_workers;i++) {
+    pthread_join(p[i], NULL);
+  }
+
+  for(i=0;i<download_workers;i++) {
+    pthread_join(d[i], NULL);
+  }
+
+  pthread_mutex_destroy(&links->headLock);
+  pthread_mutex_destroy(&links->tailLock);
+   pthread_mutex_destroy(&pages->headLock);
+  pthread_mutex_destroy(&pages->tailLock);
+
+  pthread_cond_destroy(&links->fill);
+  pthread_cond_destroy(&links->notFull);
+  pthread_cond_destroy(&pages->fill);
+  pthread_cond_destroy(&pages->notFull);
+
+  free(pages);
+  free(links);
+  free(visited);
+  return 0;
+}                                    
